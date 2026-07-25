@@ -1,0 +1,2 @@
+# Optional. One proxy per line, format: IP PORT  (or IP:PORT)
+# Lines starting with # are ignored. Leave empty to run without proxies.
