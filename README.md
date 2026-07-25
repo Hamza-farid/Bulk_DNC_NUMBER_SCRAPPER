@@ -1,9 +1,45 @@
-# Bulk DNC / TCPA Checker
+# Bulk DNC / TCPA Checker — infolookup.site
 
 A fresh rebuild of the number-range DNC checker: Python backend + Streamlit
 frontend. Generates phone numbers in bulk from a 3-part range picker
 (area code / exchange range / line-number range), checks each one against
-the TCPA lookup API, and lets you download the results as CSV.
+`infolookup.site`'s TCPA lookup API, and lets you download the results as CSV.
+
+## How the site's auth actually works (read this first)
+
+This was reverse-engineered directly from the site's own JS (`test2.js`,
+`backend.js`) and confirmed by live testing:
+
+- The site calls `GET /lookup-token.php` to get a short-lived "`_t`" token,
+  then uses it on `GET /api/tcpa?x=<number>&_t=<token>&pi=1`.
+- **`/lookup-token.php` is public and unauthenticated** — no login, no
+  Cloudflare/Turnstile challenge. Anyone can request a token.
+- The token is a base64 blob of `<unix timestamp>|<requesting IP>.<hash>` —
+  it's cryptographically bound to whichever IP address requested it, and
+  expires after ~15 minutes.
+- Calling `/api/tcpa` with a token minted from a **different IP** than the
+  one making that call returns `HTTP 403 {"status":"error","message":"Access
+  denied."}` — even though the token itself is fresh. This is almost
+  certainly why the old tool "sometimes just didn't work": if a token gets
+  captured once (e.g. copy-pasted) and then reused from a different
+  machine/proxy/connection, it silently fails.
+
+**The practical upshot: you do not need to paste any token by hand.** This
+app mints its own token automatically via `/lookup-token.php` and reuses it
+for every request that shares the same outbound connection, refreshing it
+before it expires (see `backend/session_manager.py`). A manual override
+field still exists in the sidebar as a fallback in case the site ever locks
+that endpoint down, but as of writing you'll never need it.
+
+**Real API response shape** (confirmed live):
+```json
+{"status":"ok","phone":"8065551234","listed":"No","type":"No","state":"TX","ndnc":"No","sdnc":"No"}
+```
+A number is bucketed as **DNC** if `ndnc == Yes`, `sdnc == Yes`, or
+`listed == Yes`; otherwise **Valid**. (There's no separate
+litigator/blacklist field from this endpoint — the site's own frontend
+code only derives those from a field this data source never actually
+populates, so they're effectively folded into `listed`.)
 
 ## Project structure
 
@@ -11,10 +47,10 @@ the TCPA lookup API, and lets you download the results as CSV.
 dnc_bulk_checker/
 ├── app.py                     # Streamlit UI — the only file you "run"
 ├── backend/
-│   ├── config.py               # API URL, headers, timeouts — edit here if the endpoint changes
+│   ├── config.py               # site URLs, headers, timeouts
 │   ├── logger_setup.py         # logging to console + logs/app.log + in-app debug panel
 │   ├── number_builder.py       # builds the number list from the 3 ranges
-│   ├── session_manager.py      # session token handling + connection test
+│   ├── session_manager.py      # auto-mints & caches the per-IP lookup token
 │   ├── proxy_manager.py        # optional proxy pool
 │   ├── csv_store.py            # buffered CSV writer + resume support
 │   └── checker_engine.py       # the multi-threaded checker itself
@@ -32,38 +68,11 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-It opens at `http://localhost:8501`.
+It opens at `http://localhost:8501`. Click **Test connection** in the
+sidebar first — it mints a token and fires one real request, so you know
+immediately if everything's reachable before starting a bulk run.
 
-## 2. Get a session token (do this first, every time)
-
-The site behind the API sits behind bot-protection, which is most likely
-why the old tool "sometimes just didn't work" — an automated fetch of the
-homepage can silently hit a challenge page instead of a real session. To
-sidestep that entirely:
-
-1. Open the target site in a normal browser (Chrome/Edge).
-2. Open DevTools (F12) → **Network** tab.
-3. Do anything on the site that triggers an API call (search a number, etc.)
-4. Click on a request to `api.uspeoplesearch.net/...` in the network list.
-5. In the **Headers** panel, find `X-Session-ID` (or the `session` cookie
-   in the Cookies panel) and copy its value.
-6. In the app's sidebar, paste it into **"Paste session token / cookie / JSON"**
-   and click **Apply token**.
-7. Click **Test connection** — it fires one real request and tells you
-   plainly whether the token works, is expired, or the site is rate-limiting.
-
-There's also an **Auto-refresh (best effort)** button that tries to fetch a
-token automatically without a browser. It works when the site happens to
-serve a normal homepage, and fails cleanly (with a clear reason in the
-sidebar) when it hits a bot-check page — at which point just paste a token
-manually instead.
-
-If a token expires mid-run, the engine detects the 401/403, tries one
-automatic refresh, and if that fails it stops the run and tells you to
-paste a fresh token in the **fatal error banner** at the top of the page —
-just paste + Apply + Start again (it resumes from where it left off, see below).
-
-## 3. Choose the number range
+## 2. Choose the number range
 
 Phone numbers are NPA-NXX-XXXX (area code, exchange, line number). Instead
 of one flat range, you pick each segment separately:
@@ -72,45 +81,53 @@ of one flat range, you pick each segment separately:
 - **Exchange range** — the next 3 digits, as a start–end range, e.g. `549`–`560`.
 - **Line number range** — the last 4 digits, as a start–end range, e.g. `0000`–`9999`.
 
-The app multiplies these out for you and shows the total count live
-(`(exchange_end - exchange_start + 1) × (line_end - line_start + 1)`), so
-you can see exactly how many numbers a given range produces before starting.
-Start narrow (a small exchange range) to test things, then widen once
-you've confirmed the token and rate work well.
+The app multiplies these out for you and shows the total count live, so
+you can see exactly how many numbers a given range produces before
+starting. Start narrow to test things, then widen once you've confirmed
+things are working well.
 
-## 4. Performance settings
+## 3. Performance settings
 
-- **Parallel threads** — more threads = faster, but a higher chance of
-  getting rate-limited (HTTP 429) or the token getting flagged. Start
-  around 20–40 and watch the Debug logs panel for 429s before pushing higher.
+- **Parallel threads** — since every thread on the "direct" (no-proxy)
+  connection shares the same token, this is now mostly limited by how
+  aggressively the site rate-limits, not by session juggling. Start around
+  20–40 and watch the Debug logs panel for 429s before pushing higher.
 - **Chunk size** — numbers are processed in batches; between batches the
   engine sleeps for the configured seconds to ease off the API.
 - **Sleep between chunks** — the pause duration mentioned above.
 
-## 5. Run it
+## 4. Run it
 
 Click **Start**. You can **Pause**/**Resume** at any time, and **Stop** to
-end the run early — either way, whatever's already been written to CSV
-stays there. **Reset data** clears all three output CSVs (only enabled
-while nothing is running).
+end the run early — whatever's already been written to CSV stays there.
+**Reset data** clears all three output CSVs (only enabled while nothing is
+running).
 
 Progress, live speed, ETA, and the last dozen results are shown while a run
 is active. The bottom **Debug logs** panel shows the last 200 log lines
 (the same ones going to `logs/app.log`) — check it first if something looks
-stuck or you're getting a lot of errors.
+stuck or you're seeing a lot of errors.
 
-## 6. Resume support
+## 5. Resume support
 
 Every number written to any of the three output CSVs is remembered. If you
 stop a run and start a new one over a range that overlaps, already-checked
-numbers are automatically skipped — you won't burn time or requests
-re-checking them.
+numbers are automatically skipped.
 
-## 7. Download results
+## 6. Download results
 
 Use the **Valid / DNC / Not found / All** buttons above the table to filter,
 then **Download \<filter\> CSV** to export exactly that view. The raw CSVs
 also live directly in `data/` if you'd rather grab them from disk.
+
+## 7. Proxies (optional, and how tokens interact with them)
+
+Because the token is IP-bound, using proxies means each proxy needs its
+**own** token, minted through itself — the app already does this
+automatically (`session_manager.py` keys everything by proxy address). If
+you add proxies to `proxies.txt`, no other setup is needed; just know that
+the first request through a new proxy will always cost one extra round-trip
+to mint that proxy's token.
 
 ## 8. Deploying to Streamlit Community Cloud
 
@@ -118,8 +135,8 @@ also live directly in `data/` if you'd rather grab them from disk.
    is included so the `data/` CSVs and `logs/` don't get committed).
 2. On [share.streamlit.io](https://share.streamlit.io), create a new app,
    point it at the repo, and set the main file to `app.py`.
-3. No secrets are required — the session token is pasted at runtime in the
-   sidebar, not stored in code.
+3. No secrets are required — everything auth-related happens automatically
+   at runtime.
 4. **Important limitation**: Streamlit Cloud's filesystem is ephemeral and
    the app can sleep after inactivity — a long bulk run left unattended may
    get interrupted, and `data/`/`logs/` reset on redeploy. For genuinely
@@ -133,10 +150,16 @@ also live directly in `data/` if you'd rather grab them from disk.
 If checks are failing or nothing is happening:
 
 1. Open the **Debug logs** expander at the bottom of the page first.
-2. Click **Test connection** in the sidebar — it tells you directly if the
-   token is expired (401/403), you're rate-limited (429), or the response
-   isn't real JSON (usually a bot-check page slipping through).
-3. If you see repeated 429s, lower the thread count and/or increase the
+2. Click **Test connection** in the sidebar — it mints a token and fires
+   one real request, telling you directly whether it worked, got rate
+   limited (429), or was rejected (403 — normally means the token got
+   invalidated and needs a re-mint, which happens automatically on the
+   next request).
+3. If you see a burst of repeated 403s during a run, that's the app
+   catching a token-vs-IP mismatch and automatically re-minting — it's
+   expected occasionally and self-heals. If it happens on *every* request,
+   your network path may have an unstable/rotating outbound IP (some
+   corporate VPNs or certain cloud NAT setups do this) — try running from
+   a plain home/office connection or a standard VPS instead.
+4. If you see repeated 429s, lower the thread count and/or increase the
    sleep-between-chunks setting.
-4. If the token keeps expiring quickly, that's normal for this kind of
-   site — just re-paste a fresh one from the browser when prompted.
